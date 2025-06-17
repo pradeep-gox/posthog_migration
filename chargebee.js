@@ -1,4 +1,5 @@
 const fs = require("fs");
+const path = require("path");
 const axios = require("axios");
 const qs = require("qs");
 
@@ -9,11 +10,49 @@ try {
   // dotenv not installed or .env file doesn't exist - that's fine
 }
 
-const CHARGEBEE_HOST = process.env.CHARGEBEE_HOST;
-const CHARGEBEE_KEY = process.env.CHARGEBEE_KEY;
+// Configuration
+const CONFIG = {
+  CHARGEBEE_HOST: process.env.CHARGEBEE_HOST,
+  CHARGEBEE_KEY: process.env.CHARGEBEE_KEY,
+  CHARGEBEE_EVENTS_FILE:
+    process.env.CHARGEBEE_EVENTS_FILE || "chargebee_events.jsonl",
+  PROGRESS_FILE:
+    process.env.CHARGEBEE_PROGRESS_FILE || "chargebee_progress.json",
+  TIMESTAMP_BOUND_END: parseInt(process.env.TIMESTAMP_BOUND_END) || 1739791186,
+  MAX_RETRIES: parseInt(process.env.MAX_RETRIES) || 3,
+  INITIAL_RETRY_DELAY: parseInt(process.env.INITIAL_RETRY_DELAY) || 5000,
+  REQUEST_TIMEOUT: parseInt(process.env.REQUEST_TIMEOUT) || 30000,
+  RATE_LIMIT_DELAY: parseInt(process.env.RATE_LIMIT_DELAY) || 5000,
+  BATCH_SIZE: parseInt(process.env.BATCH_SIZE) || 100,
+  MAX_EVENTS_LIMIT: parseInt(process.env.MAX_EVENTS_LIMIT) || null,
+};
 
-const CHARGEBEE_EVENTS_FILE = process.env.CHARGEBEE_EVENTS_FILE;
-const TIMESTAMP_BOUND_END = 1739791186;
+// Validate required environment variables
+function validateConfig() {
+  const required = ["CHARGEBEE_HOST", "CHARGEBEE_KEY"];
+  const missing = required.filter((key) => !CONFIG[key]);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables: ${missing.join(", ")}`
+    );
+  }
+
+  if (!CONFIG.CHARGEBEE_HOST.startsWith("http")) {
+    throw new Error(
+      "CHARGEBEE_HOST must be a valid URL starting with http/https"
+    );
+  }
+
+  log(`Configuration validated successfully`);
+  log(`Events file: ${CONFIG.CHARGEBEE_EVENTS_FILE}`);
+  log(`Progress file: ${CONFIG.PROGRESS_FILE}`);
+  log(
+    `Timestamp bound: ${CONFIG.TIMESTAMP_BOUND_END} (${new Date(
+      CONFIG.TIMESTAMP_BOUND_END * 1000
+    ).toISOString()})`
+  );
+}
 
 const plans = [
   ["gs", "pro-yearly-120", 2, "Pro"],
@@ -23,9 +62,9 @@ const plans = [
   ["gs", "pro-monthly-9", 2, "Pro"],
   ["gs", "pro-lifetime-159", 2, "Pro"],
   ["gs", "pro-monthly-30", 2, "Pro"],
-  ["gs", "startup-monhtly-60,6,Startup"],
-  ["gs", "solo-monthly-30,5,Solo"],
-  ["gs", "pro-monthly-99,2,Pro"],
+  ["gs", "startup-monhtly-60", 6, "Startup"],
+  ["gs", "solo-monthly-30", 5, "Solo"],
+  ["gs", "pro-monthly-99", 2, "Pro"],
   ["gs", "pro-yearly-49", 2, "Pro"],
   ["gs", "pro-monthly-62", 2, "Pro"],
   ["gs", "basic-yearly-19", 3, "Basic"],
@@ -163,14 +202,131 @@ const plans = [
   ["gds", "gds-business-v202411-BF-INR-Yearly", 19, "Business"],
 ];
 
+// Progress tracking
+class ProgressTracker {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.data = this.load();
+  }
+
+  load() {
+    try {
+      if (fs.existsSync(this.filePath)) {
+        const content = fs.readFileSync(this.filePath, "utf8");
+        return JSON.parse(content);
+      }
+    } catch (error) {
+      log(`Warning: Could not load progress file: ${error.message}`, "WARN");
+    }
+
+    return {
+      lastOffset: null,
+      totalEventsProcessed: 0,
+      startTime: new Date().toISOString(),
+      lastUpdateTime: new Date().toISOString(),
+      errors: [],
+      completed: false,
+    };
+  }
+
+  save() {
+    try {
+      this.data.lastUpdateTime = new Date().toISOString();
+      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+    } catch (error) {
+      log(`Error saving progress: ${error.message}`, "ERROR");
+    }
+  }
+
+  update(offset, eventsCount) {
+    this.data.lastOffset = offset;
+    this.data.totalEventsProcessed += eventsCount;
+    this.save();
+  }
+
+  addError(error) {
+    this.data.errors.push({
+      timestamp: new Date().toISOString(),
+      error: error.toString(),
+    });
+    this.save();
+  }
+
+  markCompleted() {
+    this.data.completed = true;
+    this.data.completedTime = new Date().toISOString();
+    this.save();
+  }
+
+  getStatus() {
+    return {
+      totalEvents: this.data.totalEventsProcessed,
+      lastOffset: this.data.lastOffset,
+      startTime: this.data.startTime,
+      isCompleted: this.data.completed,
+      errorCount: this.data.errors.length,
+    };
+  }
+}
+
 // Helper function to log with timestamp
 function log(message, level = "INFO") {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] [${level}] ${message}`);
 }
 
-// Helper function to sleep
+// Helper function to sleep with exponential backoff
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const exponentialBackoff = (attempt) => {
+  return (
+    CONFIG.INITIAL_RETRY_DELAY * Math.pow(2, attempt) + Math.random() * 1000
+  );
+};
+
+// Enhanced API request with retry logic
+async function makeRetryableRequest(requestFn, context = "") {
+  let lastError;
+
+  for (let attempt = 0; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = exponentialBackoff(attempt - 1);
+        log(
+          `Retrying ${context} (attempt ${attempt}/${
+            CONFIG.MAX_RETRIES
+          }) after ${Math.round(delay)}ms`,
+          "WARN"
+        );
+        await sleep(delay);
+      }
+
+      return await requestFn();
+    } catch (error) {
+      lastError = error;
+
+      // Check if error is retryable
+      const isRetryable =
+        error.code === "ECONNRESET" ||
+        error.code === "ETIMEDOUT" ||
+        error.code === "ENOTFOUND" ||
+        (error.response &&
+          [429, 500, 502, 503, 504].includes(error.response.status));
+
+      if (!isRetryable || attempt === CONFIG.MAX_RETRIES) {
+        log(
+          `Non-retryable error or max retries reached for ${context}: ${error.message}`,
+          "ERROR"
+        );
+        throw error;
+      }
+
+      log(`Retryable error for ${context}: ${error.message}`, "WARN");
+    }
+  }
+
+  throw lastError;
+}
 
 const processChargebeeEventResponse = (data) => {
   const eventsList = data?.list ?? [];
@@ -186,16 +342,16 @@ const processChargebeeEventResponse = (data) => {
         content: event.content,
       };
     })
-    .filter((e) => e.occurred_at < TIMESTAMP_BOUND_END);
+    .filter((e) => e.occurred_at < CONFIG.TIMESTAMP_BOUND_END);
 
   return { events, next_offset: nextOffset };
 };
 
 const getChargebeeEvents = async (offset = null) => {
-  try {
-    let url = `${CHARGEBEE_HOST}/api/v2/events`;
+  const requestFn = async () => {
+    let url = `${CONFIG.CHARGEBEE_HOST}/api/v2/events`;
     const params = {
-      limit: 100,
+      limit: CONFIG.BATCH_SIZE,
       "event_type[in]": [
         "subscription_created",
         "subscription_changed",
@@ -207,34 +363,47 @@ const getChargebeeEvents = async (offset = null) => {
         "payment_succeeded",
       ],
     };
+
     if (offset) params["offset"] = offset;
+
     const strParams = qs.stringify(params);
     const response = await axios.get(`${url}?${strParams}`, {
       headers: {
-        Authorization: `Basic ${CHARGEBEE_KEY}`,
+        Authorization: `Basic ${CONFIG.CHARGEBEE_KEY}`,
         "Content-Type": "application/json",
       },
+      timeout: CONFIG.REQUEST_TIMEOUT,
     });
+
     return processChargebeeEventResponse(response.data);
+  };
+
+  try {
+    return await makeRetryableRequest(
+      requestFn,
+      `Chargebee API (offset: ${offset})`
+    );
   } catch (error) {
     log(
-      `Error fetching Chargebee events: ${offset} : ${error?.response?.data?.message}`,
+      `Failed to fetch Chargebee events after all retries: ${error.message}`,
       "ERROR"
     );
     return { events: [], next_offset: null };
   }
 };
 
-getOriginBySubscription = (subscriptionData) => {
+const getOriginBySubscription = (subscriptionData) => {
   if (subscriptionData) {
     const subscription = subscriptionData?.subscription_items?.find(
       (item) => item.item_type == "plan"
     );
-    switch (subscription.item_price_id.split("-")[0]) {
-      case "gds":
-        return "gds";
-      default:
-        return "gs";
+    if (subscription?.item_price_id) {
+      switch (subscription.item_price_id.split("-")[0]) {
+        case "gds":
+          return "gds";
+        default:
+          return "gs";
+      }
     }
   }
   return "gs";
@@ -406,51 +575,238 @@ const getProcessedEvent = (event) => {
   };
 };
 
-const writeEventsToFile = async (events) => {
+const writeEventsToFile = async (events, isNewFile = false) => {
   try {
-    const fileStream = fs.createWriteStream(CHARGEBEE_EVENTS_FILE, {
-      flags: "a",
+    const fileStream = fs.createWriteStream(CONFIG.CHARGEBEE_EVENTS_FILE, {
+      flags: isNewFile ? "w" : "a",
     });
-    for (const event of events) {
-      fileStream.write(JSON.stringify(getProcessedEvent(event)) + "\n");
-    }
-    fileStream.end();
-    log(`Wrote ${events.length} events to file`);
+
+    return new Promise((resolve, reject) => {
+      fileStream.on("error", reject);
+      fileStream.on("finish", resolve);
+
+      for (const event of events) {
+        try {
+          fileStream.write(JSON.stringify(getProcessedEvent(event)) + "\n");
+        } catch (error) {
+          log(`Error processing event ${event.id}: ${error.message}`, "WARN");
+          continue;
+        }
+      }
+
+      fileStream.end();
+    });
   } catch (error) {
     log(`Error writing events to file: ${error?.message}`, "ERROR");
+    throw error;
   }
 };
 
+// Signal handling for graceful shutdown
+let shouldStop = false;
+process.on("SIGINT", () => {
+  log("Received SIGINT, finishing current batch and stopping...", "INFO");
+  shouldStop = true;
+});
+
+process.on("SIGTERM", () => {
+  log("Received SIGTERM, finishing current batch and stopping...", "INFO");
+  shouldStop = true;
+});
+
 const run = async () => {
-  let next_offset = null;
-  let totalEvents = 0;
+  try {
+    // Validate configuration
+    validateConfig();
 
-  // clear file before writing
-  fs.writeFileSync(CHARGEBEE_EVENTS_FILE, "");
+    // Initialize progress tracker
+    const progressTracker = new ProgressTracker(CONFIG.PROGRESS_FILE);
+    const status = progressTracker.getStatus();
 
-  do {
-    const result = await getChargebeeEvents(next_offset);
-    next_offset = result.next_offset;
-
-    if (result.events.length > 0) {
-      console.log("getChargebeeEvents", result.events.length);
-      await writeEventsToFile(result.events);
-      totalEvents += result.events.length;
-      log(`Processed ${totalEvents} events so far`);
+    // Check if already completed
+    if (status.isCompleted) {
+      log(
+        `Process already completed. Total events: ${status.totalEvents}`,
+        "INFO"
+      );
+      log(
+        `To restart, delete the progress file: ${CONFIG.PROGRESS_FILE}`,
+        "INFO"
+      );
+      return;
     }
 
-    // Add a small delay to avoid rate limiting
-    await sleep(5000);
-    if (totalEvents > 10000) {
-      break;
-    }
-  } while (next_offset);
+    // Resume from last position
+    let next_offset = status.lastOffset;
+    let totalEvents = status.totalEvents;
+    const startTime = Date.now();
 
-  log(`Completed! Total events processed: ${totalEvents}`);
+    log(`Starting extraction process...`, "INFO");
+    if (next_offset) {
+      log(`Resuming from offset: ${next_offset}`, "INFO");
+      log(`Already processed: ${totalEvents} events`, "INFO");
+    } else {
+      log(`Starting fresh extraction`, "INFO");
+      // Clear file only if starting fresh
+      fs.writeFileSync(CONFIG.CHARGEBEE_EVENTS_FILE, "");
+    }
+
+    let batchCount = 0;
+    let consecutiveEmptyBatches = 0;
+    const maxConsecutiveEmptyBatches = 10000000;
+
+    do {
+      if (shouldStop) {
+        log("Stopping due to signal...", "INFO");
+        break;
+      }
+
+      // Check if we've hit the limit
+      if (CONFIG.MAX_EVENTS_LIMIT && totalEvents >= CONFIG.MAX_EVENTS_LIMIT) {
+        log(`Reached maximum events limit: ${CONFIG.MAX_EVENTS_LIMIT}`, "INFO");
+        break;
+      }
+
+      batchCount++;
+      log(
+        `Processing batch ${batchCount} (offset: ${
+          next_offset || "initial"
+        })...`,
+        "INFO"
+      );
+
+      try {
+        const result = await getChargebeeEvents(next_offset);
+        next_offset = result.next_offset;
+
+        if (result.events.length === 0) {
+          consecutiveEmptyBatches++;
+          log(
+            `Empty batch received (${consecutiveEmptyBatches}/${maxConsecutiveEmptyBatches})`,
+            "WARN"
+          );
+
+          if (consecutiveEmptyBatches >= maxConsecutiveEmptyBatches) {
+            log(
+              `Received ${maxConsecutiveEmptyBatches} consecutive empty batches, stopping`,
+              "INFO"
+            );
+            break;
+          }
+        } else {
+          consecutiveEmptyBatches = 0;
+
+          // Write events to file
+          await writeEventsToFile(
+            result.events,
+            totalEvents === 0 && next_offset === null
+          );
+
+          // Update progress
+          totalEvents += result.events.length;
+          progressTracker.update(next_offset, result.events.length);
+
+          // Calculate and log stats
+          const elapsedTime = Date.now() - startTime;
+          const eventsPerSecond = totalEvents / (elapsedTime / 1000);
+          const oldestEvent = result.events.reduce(
+            (oldest, event) =>
+              event.occurred_at < oldest.occurred_at ? event : oldest,
+            result.events[0]
+          );
+          const newestEvent = result.events.reduce(
+            (newest, event) =>
+              event.occurred_at > newest.occurred_at ? event : newest,
+            result.events[0]
+          );
+
+          log(
+            `Batch ${batchCount} completed: ${result.events.length} events processed`,
+            "INFO"
+          );
+          log(
+            `Total events: ${totalEvents} | Rate: ${eventsPerSecond.toFixed(
+              2
+            )} events/sec`,
+            "INFO"
+          );
+          log(
+            `Event date range: ${
+              new Date(oldestEvent.occurred_at * 1000)
+                .toISOString()
+                .split("T")[0]
+            } to ${
+              new Date(newestEvent.occurred_at * 1000)
+                .toISOString()
+                .split("T")[0]
+            }`,
+            "INFO"
+          );
+
+          if (next_offset) {
+            log(`Next offset: ${next_offset}`, "DEBUG");
+          }
+        }
+
+        // Rate limiting
+        if (CONFIG.RATE_LIMIT_DELAY > 0) {
+          await sleep(CONFIG.RATE_LIMIT_DELAY);
+        }
+      } catch (error) {
+        log(`Error in batch ${batchCount}: ${error.message}`, "ERROR");
+        progressTracker.addError(error);
+
+        // For critical errors, stop the process
+        if (error.response?.status === 401 || error.response?.status === 403) {
+          log("Authentication error, stopping process", "ERROR");
+          break;
+        }
+
+        // For other errors, continue with backoff
+        await sleep(exponentialBackoff(1));
+      }
+    } while (next_offset && !shouldStop);
+
+    // Mark as completed if we finished normally
+    if (!shouldStop && !next_offset) {
+      progressTracker.markCompleted();
+      log(`Extraction completed successfully!`, "INFO");
+    }
+
+    // Final statistics
+    const finalStatus = progressTracker.getStatus();
+    const totalTime = Date.now() - startTime;
+
+    log(`=== EXTRACTION SUMMARY ===`, "INFO");
+    log(`Total events processed: ${finalStatus.totalEvents}`, "INFO");
+    log(`Total time: ${(totalTime / 1000 / 60).toFixed(2)} minutes`, "INFO");
+    log(
+      `Average rate: ${(finalStatus.totalEvents / (totalTime / 1000)).toFixed(
+        2
+      )} events/sec`,
+      "INFO"
+    );
+    log(`Errors encountered: ${finalStatus.errorCount}`, "INFO");
+    log(`Output file: ${CONFIG.CHARGEBEE_EVENTS_FILE}`, "INFO");
+    log(`Progress file: ${CONFIG.PROGRESS_FILE}`, "INFO");
+
+    if (finalStatus.isCompleted) {
+      log(`Status: COMPLETED`, "INFO");
+    } else if (shouldStop) {
+      log(`Status: STOPPED BY USER - Can be resumed`, "INFO");
+    } else {
+      log(`Status: STOPPED DUE TO ERROR - Check logs and resume`, "WARN");
+    }
+  } catch (error) {
+    log(`Fatal error: ${error.message}`, "ERROR");
+    console.error(error);
+    process.exit(1);
+  }
 };
 
 // Start the function
+
 run().catch((error) => {
-  log(`Chargebee events write failed: ${error.message}`, "ERROR");
+  log(`Chargebee events extraction failed: ${error.message}`, "ERROR");
   process.exit(1);
 });
