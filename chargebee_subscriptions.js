@@ -1,57 +1,3 @@
-const fs = require("fs");
-const axios = require("axios");
-
-// Load environment variables from .env file if it exists
-try {
-  require("dotenv").config();
-} catch (error) {
-  // dotenv not installed or .env file doesn't exist - that's fine
-}
-
-// Configuration
-const CONFIG = {
-  CHARGEBEE_HOST: process.env.CHARGEBEE_HOST,
-  CHARGEBEE_KEY: process.env.CHARGEBEE_KEY,
-  CHARGEBEE_EVENTS_FILE:
-    process.env.CHARGEBEE_EVENTS_FILE || "chargebee_events.jsonl",
-  PROGRESS_FILE:
-    process.env.CHARGEBEE_PROGRESS_FILE || "chargebee_progress.json",
-  TIMESTAMP_BOUND_END: parseInt(process.env.TIMESTAMP_BOUND_END) || 1749194999,
-  MAX_RETRIES: parseInt(process.env.MAX_RETRIES) || 3,
-  INITIAL_RETRY_DELAY: parseInt(process.env.INITIAL_RETRY_DELAY) || 5000,
-  REQUEST_TIMEOUT: parseInt(process.env.REQUEST_TIMEOUT) || 30000,
-  RATE_LIMIT_DELAY: parseInt(process.env.RATE_LIMIT_DELAY) || 5000,
-  BATCH_SIZE: parseInt(process.env.BATCH_SIZE) || 100,
-  MAX_EVENTS_LIMIT: parseInt(process.env.MAX_EVENTS_LIMIT) || null,
-};
-
-// Validate required environment variables
-function validateConfig() {
-  const required = ["CHARGEBEE_HOST", "CHARGEBEE_KEY"];
-  const missing = required.filter((key) => !CONFIG[key]);
-
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required environment variables: ${missing.join(", ")}`
-    );
-  }
-
-  if (!CONFIG.CHARGEBEE_HOST.startsWith("http")) {
-    throw new Error(
-      "CHARGEBEE_HOST must be a valid URL starting with http/https"
-    );
-  }
-
-  log(`Configuration validated successfully`);
-  log(`Events file: ${CONFIG.CHARGEBEE_EVENTS_FILE}`);
-  log(`Progress file: ${CONFIG.PROGRESS_FILE}`);
-  log(
-    `Timestamp bound: ${CONFIG.TIMESTAMP_BOUND_END} (${new Date(
-      CONFIG.TIMESTAMP_BOUND_END * 1000
-    ).toISOString()})`
-  );
-}
-
 const plans = [
   ["gs", "pro-yearly-120", 2, "Pro"],
   ["gs", "pro-monthly-24", 2, "Pro"],
@@ -200,6 +146,48 @@ const plans = [
   ["gds", "gds-business-v202411-BF-INR-Yearly", 19, "Business"],
 ];
 
+const fs = require("fs");
+const axios = require("axios");
+
+// Load environment variables from .env file if it exists
+try {
+  require("dotenv").config();
+} catch (error) {
+  // dotenv not installed or .env file doesn't exist - that's fine
+}
+
+// Configuration
+const CONFIG = {
+  CHARGEBEE_HOST: process.env.CHARGEBEE_HOST,
+  CHARGEBEE_KEY: process.env.CHARGEBEE_KEY,
+  CHARGEBEE_EVENTS_FILE:
+    process.env.CHARGEBEE_EVENTS_FILE || "chargebee_events.jsonl",
+  PROGRESS_FILE:
+    process.env.CHARGEBEE_PROGRESS_FILE || "chargebee_progress.json",
+  TIMESTAMP_BOUND_END: parseInt(process.env.TIMESTAMP_BOUND_END) || 1749194999,
+  MAX_RETRIES: parseInt(process.env.MAX_RETRIES) || 3,
+  INITIAL_RETRY_DELAY: parseInt(process.env.INITIAL_RETRY_DELAY) || 5000,
+  REQUEST_TIMEOUT: parseInt(process.env.REQUEST_TIMEOUT) || 30000,
+  RATE_LIMIT_DELAY: parseInt(process.env.RATE_LIMIT_DELAY) || 5000,
+  BATCH_SIZE: parseInt(process.env.BATCH_SIZE) || 100,
+  MAX_EVENTS_LIMIT: parseInt(process.env.MAX_EVENTS_LIMIT) || null,
+};
+
+// Helper function to log with timestamp
+function log(message, level = "INFO") {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] [${level}] ${message}`);
+}
+
+// Helper function to sleep with exponential backoff
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const exponentialBackoff = (attempt) => {
+  return (
+    CONFIG.INITIAL_RETRY_DELAY * Math.pow(2, attempt) + Math.random() * 1000
+  );
+};
+
 // Progress tracking
 class ProgressTracker {
   constructor(filePath) {
@@ -267,21 +255,6 @@ class ProgressTracker {
   }
 }
 
-// Helper function to log with timestamp
-function log(message, level = "INFO") {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] [${level}] ${message}`);
-}
-
-// Helper function to sleep with exponential backoff
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const exponentialBackoff = (attempt) => {
-  return (
-    CONFIG.INITIAL_RETRY_DELAY * Math.pow(2, attempt) + Math.random() * 1000
-  );
-};
-
 // Enhanced API request with retry logic
 async function makeRetryableRequest(requestFn, context = "") {
   let lastError;
@@ -326,174 +299,43 @@ async function makeRetryableRequest(requestFn, context = "") {
   throw lastError;
 }
 
-const processChargebeeEventResponse = (data) => {
-  const eventsList = data?.list ?? [];
-  const nextOffset = data?.next_offset ?? null;
+const getSubscriptionEventPayload = (s) => {
+  const { customer, subscription } = s;
+  const emailId = customer.email?.toLowerCase();
 
-  const events = eventsList
-    .map((e) => {
-      const event = e.event;
-      return {
-        id: event.id,
-        event_type: event.event_type,
-        occurred_at: event.occurred_at,
-        content: event.content,
-      };
-    })
-    .filter((e) => e.occurred_at < CONFIG.TIMESTAMP_BOUND_END);
-
-  return { events, next_offset: nextOffset };
-};
-
-const getChargebeeEvents = async (offset = null) => {
-  const requestFn = async () => {
-    const eventTypes = JSON.stringify(["payment_succeeded"]);
-    const config = {
-      method: "get",
-      url: `${CONFIG.CHARGEBEE_HOST}/api/v2/events`,
-      headers: {
-        Authorization: `Basic ${CONFIG.CHARGEBEE_KEY}`,
-        "Content-Type": "application/json",
-      },
-      params: {
-        limit: CONFIG.BATCH_SIZE,
-        "occurred_at[before]": CONFIG.TIMESTAMP_BOUND_END.toString(),
-        "event_type[in]": eventTypes,
-      },
-      paramsSerializer: {
-        encode: (param) => {
-          if (param === eventTypes) return param;
-          return encodeURIComponent(param);
-        },
-      },
-    };
-
-    if (offset) config.params.offset = offset;
-
-    const response = await axios(config);
-    return processChargebeeEventResponse(response.data);
-  };
-
-  try {
-    return await makeRetryableRequest(
-      requestFn,
-      `Chargebee API (offset: ${offset})`
-    );
-  } catch (error) {
-    log(
-      `Failed to fetch Chargebee events after all retries: ${error.message}`,
-      "ERROR"
-    );
-    return { events: [], next_offset: null };
-  }
-};
-
-const getOriginBySubscription = (subscriptionData) => {
-  if (subscriptionData) {
-    const subscription = subscriptionData?.subscription_items?.find(
-      (item) => item.item_type == "plan"
-    );
-    if (subscription?.item_price_id) {
-      switch (subscription.item_price_id.split("-")[0]) {
-        case "gds":
-          return "gds";
-        default:
-          return "gs";
-      }
-    }
-  }
-  return "gs";
-};
-
-const getFirstSourceDetails = (firstSource) => {
-  const result = {
-    tmrCustomerFirstSource: null,
-    tmrCustomerFirstMedium: null,
-    tmrCustomerFirstCampaign: null,
-    tmrCustomerFirstLP: null,
-  };
-  if (!firstSource) return result;
-  const firstSourceArray = firstSource.split("|");
-  //? www.google.com|none|none|https://twominutereports.com/blog/dashthis-alternatives
-  if (firstSourceArray.length === 4) {
-    result.tmrCustomerFirstSource = firstSourceArray[0];
-    result.tmrCustomerFirstMedium = firstSourceArray[1];
-    result.tmrCustomerFirstCampaign = firstSourceArray[2];
-    result.tmrCustomerFirstLP = firstSourceArray[3];
-  }
-  return result;
-};
-
-const getSignupSourceDetails = (signupSource) => {
-  const result = {
-    tmrCustomerSignupSource: null,
-    tmrCustomerSignupMedium: null,
-    tmrCustomerSignupCampaign: null,
-    tmrCustomerSignupLP: null,
-  };
-  if (!signupSource) return result;
-  const signupSourceArray = signupSource.split("|");
-  //? Eg: www.google.com|none|none|https://twominutereports.com/
-  if (signupSourceArray.length === 4) {
-    result.tmrCustomerSignupSource = signupSourceArray[0];
-    result.tmrCustomerSignupMedium = signupSourceArray[1];
-    result.tmrCustomerSignupCampaign = signupSourceArray[2];
-    result.tmrCustomerSignupLP = signupSourceArray[3];
-  }
-  return result;
-};
-
-const getProcessedEvent = (event) => {
-  const { event_type, occurred_at, content } = event;
-
-  const eventName = `tmr_${
-    event_type === "payment_succeeded"
-      ? "subscription_payment_succeeded"
-      : event_type
-  }`;
-  const timestamp =
-    new Date(occurred_at * 1000).toISOString().split(".")[0] + "Z";
-
-  const customerEmailId = content?.customer?.email?.toLowerCase();
-  const origin = getOriginBySubscription(content?.subscription);
-  const signedUpFrom = content?.customer?.cf_signedup_from;
-
-  const firstSourceDetails = getFirstSourceDetails(
-    content?.customer?.cf_first_source_v2 ?? content?.customer?.cf_first_source
-  );
-  const signupSourceDetails = getSignupSourceDetails(
-    content?.customer?.cf_signup_source_v2 ??
-      content?.customer?.cf_signup_source
-  );
-
-  const subscriptionCreatedAt = content?.subscription?.created_at
-    ? new Date(content?.subscription?.created_at * 1000)
-        .toISOString()
-        .split(".")[0] + "Z"
+  const subscriptionStatus = subscription.status;
+  const subscriptionCreatedAt = subscription.created_at
+    ? new Date(subscription.created_at * 1000).toISOString().split(".")[0] + "Z"
     : null;
-  const subscriptionUpdatedAt = content?.subscription?.updated_at
-    ? new Date(content?.subscription?.updated_at * 1000)
-        .toISOString()
-        .split(".")[0] + "Z"
+  const subscriptionUpdatedAt = subscription.updated_at
+    ? new Date(subscription.updated_at * 1000).toISOString().split(".")[0] + "Z"
     : null;
-  const subscriptionStartedAt = content?.subscription?.started_at
-    ? new Date(content?.subscription?.started_at * 1000)
-        .toISOString()
-        .split(".")[0] + "Z"
+  const subscriptionStartedAt = subscription.started_at
+    ? new Date(subscription.started_at * 1000).toISOString().split(".")[0] + "Z"
     : null;
-  const subscriptionCancelledAt = content?.subscription?.cancelled_at
-    ? new Date(content?.subscription?.cancelled_at * 1000)
-        .toISOString()
-        .split(".")[0] + "Z"
+  const subscriptionActivatedAt = subscription.activated_at
+    ? new Date(subscription.activated_at * 1000).toISOString().split(".")[0] +
+      "Z"
+    : null;
+  const subscriptionCancelledAt = subscription.cancelled_at
+    ? new Date(subscription.cancelled_at * 1000).toISOString().split(".")[0] +
+      "Z"
     : null;
 
-  const subscriptionItems = content?.subscription?.subscription_items || [];
+  const subscriptionItems = subscription.subscription_items || [];
 
   const subscriptionPlanItem = subscriptionItems.find(
     (item) => item.item_type === "plan"
   );
+
   const subscriptionPlanId = subscriptionPlanItem?.item_price_id;
+
+  const origin = subscriptionPlanId.split("-")[0] === "gds" ? "gds" : "gs";
   const subscriptionPlanAmount = subscriptionPlanItem?.amount ?? 0;
+
+  const subscriptionPlanName =
+    plans.find((p) => p[0] === origin && p[1] === subscriptionPlanId)?.[3] ??
+    null;
 
   const subscriptionUserAddonItem = subscriptionItems.find(
     (item) => item.item_type === "addon" && item.item_price_id.includes("user")
@@ -524,54 +366,77 @@ const getProcessedEvent = (event) => {
     subscriptionUserAddonAmount +
     subscriptionAccountAddonAmount;
 
-  const tmrPlan = plans.find(
-    (p) => p[0] === origin && p[1] === subscriptionPlanId
-  );
-  const tmrPlanId = tmrPlan?.[2] ?? null;
-  const tmrPlanName = tmrPlan?.[3] ?? null;
-
-  const eventProperties = {
-    distinct_id: customerEmailId,
-    tmrOrigin: origin,
-    tmrCustomerEmailId: customerEmailId,
-    tmrCustomerId: content?.subscription?.customer_id ?? null,
-    tmrCustomerSignedUpFrom: signedUpFrom ?? null,
-    tmrSignedUpFrom: signedUpFrom ?? null,
-    tmrPlanId: tmrPlanId,
-    tmrSubscriptionVendorName: "chargebee",
-    tmrSubscriptionId: content?.subscription?.id ?? null,
-    tmrSubscriptionTotalAmount: subscriptionTotalAmount,
-    tmrSubscriptionPlanName: tmrPlanName,
-    tmrSubscriptionPlanId: subscriptionPlanId ?? null,
-    tmrSubscriptionPlanAmount: subscriptionPlanAmount,
-    tmrSubscriptionStatus: content?.subscription?.status ?? null,
-    tmrSubscriptionBillingPeriod: content?.subscription?.billing_period ?? null,
-    tmrSubscriptionBillingPeriodUnit:
-      content?.subscription?.billing_period_unit,
-    tmrSubscriptionCreatedAt: subscriptionCreatedAt,
-    tmrSubscriptionUpdatedAt: subscriptionUpdatedAt,
-    tmrSubscriptionStartedAt: subscriptionStartedAt,
-    tmrSubscriptionCancelledAt: subscriptionCancelledAt,
-    tmrSubscriptionCancelReason: content?.subscription?.cancel_reason ?? null,
-    tmrSubscriptionCurrencyCode: content?.subscription?.currency_code ?? null,
-    tmrSubscriptionUserAddonQuantity: subscriptionUserAddonQuantity,
-    tmrSubscriptionUserAddonAmount: subscriptionUserAddonAmount,
-    tmrSubscriptionUserAddonUnitPrice: subscriptionUserAddonUnitPrice,
-    tmrSubscriptionAccountAddonQuantity: subscriptionAccountAddonQuantity,
-    tmrSubscriptionAccountAddonAmount: subscriptionAccountAddonAmount,
-    tmrSubscriptionAccountAddonUnitPrice: subscriptionAccountAddonUnitPrice,
-    ...firstSourceDetails,
-    ...signupSourceDetails,
-  };
-
   return {
-    event: eventName,
-    timestamp: timestamp,
-    properties: eventProperties,
+    distinctId: emailId,
+    event: "$set",
+    properties: {
+      [`tmrSubscriptionStatus_${origin}`]: subscriptionStatus ?? null,
+      [`tmrSubscriptionPlanName_${origin}`]: subscriptionPlanName ?? null,
+      [`tmrSubscriptionBillingPeriod_${origin}`]:
+        subscription?.billing_period ?? null,
+      [`tmrSubscriptionTotalAmount_${origin}`]: subscriptionTotalAmount ?? null,
+      [`tmrSubscriptionCurrencyCode_${origin}`]:
+        subscription?.currency_code ?? null,
+      [`tmrSubscriptionCreatedAt_${origin}`]: subscriptionCreatedAt ?? null,
+      [`tmrSubscriptionUpdatedAt_${origin}`]: subscriptionUpdatedAt ?? null,
+      [`tmrSubscriptionStartedAt_${origin}`]: subscriptionStartedAt ?? null,
+      [`tmrSubscriptionActivatedAt_${origin}`]: subscriptionActivatedAt ?? null,
+      [`tmrSubscriptionCancelledAt_${origin}`]: subscriptionCancelledAt ?? null,
+      [`tmrSubscriptionCancelReason_${origin}`]:
+        subscription?.cancel_reason ?? null,
+    },
   };
 };
 
-const writeEventsToFile = async (events, isNewFile = false) => {
+const processChargebeeSubscriptionsResponse = (data) => {
+  const subscriptionsList = data?.list ?? [];
+  const nextOffset = data?.next_offset ?? null;
+
+  const subscriptions = subscriptionsList.map((s) =>
+    getSubscriptionEventPayload(s)
+  );
+
+  return { subscriptions, next_offset: nextOffset };
+};
+
+const getChargebeeSubscriptions = async (offset = null) => {
+  const requestFn = async () => {
+    const config = {
+      method: "get",
+      url: `${CONFIG.CHARGEBEE_HOST}/api/v2/subscriptions`,
+      headers: {
+        Authorization: `Basic ${CONFIG.CHARGEBEE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      params: {
+        limit: CONFIG.BATCH_SIZE,
+      },
+      paramsSerializer: {
+        encode: (param) => {
+          return encodeURIComponent(param);
+        },
+      },
+    };
+    if (offset) config.params.offset = offset;
+    const response = await axios(config);
+    return processChargebeeSubscriptionsResponse(response.data);
+  };
+
+  try {
+    return await makeRetryableRequest(
+      requestFn,
+      `Chargebee API (offset: ${offset})`
+    );
+  } catch (error) {
+    log(
+      `Failed to fetch Chargebee events after all retries: ${error.message}`,
+      "ERROR"
+    );
+    return { events: [], next_offset: null };
+  }
+};
+
+const writeSubscriptionsToFile = async (subscriptions, isNewFile = false) => {
   try {
     const fileStream = fs.createWriteStream(CONFIG.CHARGEBEE_EVENTS_FILE, {
       flags: isNewFile ? "w" : "a",
@@ -581,15 +446,13 @@ const writeEventsToFile = async (events, isNewFile = false) => {
       fileStream.on("error", reject);
       fileStream.on("finish", resolve);
 
-      for (const event of events) {
+      for (const subscription of subscriptions) {
         try {
-          fileStream.write(JSON.stringify(getProcessedEvent(event)) + "\n");
+          fileStream.write(JSON.stringify(subscription) + "\n");
         } catch (error) {
-          log(`Error processing event ${event.id}: ${error.message}`, "WARN");
           continue;
         }
       }
-
       fileStream.end();
     });
   } catch (error) {
@@ -612,9 +475,6 @@ process.on("SIGTERM", () => {
 
 const run = async () => {
   try {
-    // Validate configuration
-    validateConfig();
-
     // Initialize progress tracker
     const progressTracker = new ProgressTracker(CONFIG.PROGRESS_FILE);
     const status = progressTracker.getStatus();
@@ -672,10 +532,10 @@ const run = async () => {
       );
 
       try {
-        const result = await getChargebeeEvents(next_offset);
+        const result = await getChargebeeSubscriptions(next_offset);
         next_offset = result.next_offset;
 
-        if (result.events.length === 0) {
+        if (result.subscriptions.length === 0) {
           consecutiveEmptyBatches++;
           log(
             `Empty batch received (${consecutiveEmptyBatches}/${maxConsecutiveEmptyBatches})`,
@@ -693,49 +553,41 @@ const run = async () => {
           consecutiveEmptyBatches = 0;
 
           // Write events to file
-          await writeEventsToFile(
-            result.events,
+          await writeSubscriptionsToFile(
+            result.subscriptions,
             totalEvents === 0 && next_offset === null
           );
 
           // Update progress
-          totalEvents += result.events.length;
-          progressTracker.update(next_offset, result.events.length);
+          totalEvents += result.subscriptions.length;
+          progressTracker.update(next_offset, result.subscriptions.length);
 
           // Calculate and log stats
           const elapsedTime = Date.now() - startTime;
           const eventsPerSecond = totalEvents / (elapsedTime / 1000);
-          const oldestEvent = result.events.reduce(
-            (oldest, event) =>
-              event.occurred_at < oldest.occurred_at ? event : oldest,
-            result.events[0]
+          const oldestEvent = result.subscriptions.reduce(
+            (oldest, subscription) =>
+              subscription.created_at < oldest.created_at
+                ? subscription
+                : oldest,
+            result.subscriptions[0]
           );
-          const newestEvent = result.events.reduce(
-            (newest, event) =>
-              event.occurred_at > newest.occurred_at ? event : newest,
-            result.events[0]
+          const newestEvent = result.subscriptions.reduce(
+            (newest, subscription) =>
+              subscription.created_at > newest.created_at
+                ? subscription
+                : newest,
+            result.subscriptions[0]
           );
 
           log(
-            `Batch ${batchCount} completed: ${result.events.length} events processed`,
+            `Batch ${batchCount} completed: ${result.subscriptions.length} subscriptions processed`,
             "INFO"
           );
           log(
             `Total events: ${totalEvents} | Rate: ${eventsPerSecond.toFixed(
               2
             )} events/sec`,
-            "INFO"
-          );
-          log(
-            `Event date range: ${
-              new Date(oldestEvent.occurred_at * 1000)
-                .toISOString()
-                .split("T")[0]
-            } to ${
-              new Date(newestEvent.occurred_at * 1000)
-                .toISOString()
-                .split("T")[0]
-            }`,
             "INFO"
           );
 
@@ -803,6 +655,6 @@ const run = async () => {
 // Start the function
 
 run().catch((error) => {
-  log(`Chargebee events extraction failed: ${error.message}`, "ERROR");
+  log(`Chargebee subscriptions extraction failed: ${error.message}`, "ERROR");
   process.exit(1);
 });
